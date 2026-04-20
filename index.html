@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Harmony Visualizer</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body, #root {
+    width: 100%; height: 100%;
+    background: #08080f;
+    color: rgba(220,215,255,0.85);
+    font-family: 'Space Mono', monospace;
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #root { display: flex; flex-direction: column; }
+  button { font-family: 'Space Mono', monospace; cursor: pointer; border: none; background: none; }
+  input[type=range] { -webkit-appearance: none; height: 3px; border-radius: 2px; outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #00d4a8; cursor: pointer; }
+  @keyframes pulse { 0%,100%{opacity:.45;transform:scale(1)} 50%{opacity:.9;transform:scale(1.12)} }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ── Music ──────────────────────────────────────────────────────
+const NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const noteFreq = m => 440 * Math.pow(2,(m-69)/12);
+const noteName = m => NAMES[m%12];
+const isBlack  = m => [1,3,6,8,10].includes(m%12);
+
+// Consonance per semitone (0–11)
+const CONS = [1.0,0.05,0.35,0.78,0.85,0.88,0.12,0.95,0.62,0.72,0.52,0.18];
+
+// ── Harmony system: type → sub ─────────────────────────────────
+const HARM_SYSTEM = {
+  intervals: {
+    label: 'Intervals',
+    sub: { consonant: null }, // uses CONS directly
+    compute: (midi, roots) =>
+      roots.reduce((best,r) => Math.max(best, CONS[((midi-r)%12+12)%12]), 0),
+  },
+  chord: {
+    label: 'Chord',
+    sub: {
+      major:  [0,4,7],
+      minor:  [0,3,7],
+      maj7:   [0,4,7,11],
+      dom7:   [0,4,7,10],
+      min7:   [0,3,7,10],
+      sus4:   [0,5,7],
+    },
+    compute: (midi, roots, sub) => {
+      const pattern = HARM_SYSTEM.chord.sub[sub] || [0,4,7];
+      return roots.reduce((best,r) => {
+        const s = ((midi-r)%12+12)%12;
+        return Math.max(best, pattern.includes(s) ? 0.95 : CONS[s]*0.28);
+      },0);
+    },
+  },
+  scale: {
+    label: 'Scale',
+    sub: {
+      major:  [0,2,4,5,7,9,11],
+      minor:  [0,2,3,5,7,8,10],
+      penta:  [0,2,4,7,9],
+      blues:  [0,3,5,6,7,10],
+      dorian: [0,2,3,5,7,9,10],
+      lydian: [0,2,4,6,7,9,11],
+    },
+    compute: (midi, roots, sub) => {
+      const scale = HARM_SYSTEM.scale.sub[sub] || [0,2,4,5,7,9,11];
+      return roots.reduce((best,r) => {
+        const s = ((midi-r)%12+12)%12;
+        return Math.max(best, scale.includes(s) ? 0.9+CONS[s]*0.1 : CONS[s]*0.22);
+      },0);
+    },
+  },
+};
+
+function getHarmScore(midi, roots, type, sub) {
+  if (!roots.length) return 0;
+  const h = HARM_SYSTEM[type];
+  return h ? h.compute(midi, roots, sub) : 0;
+}
+
+// ── Heat LUT ───────────────────────────────────────────────────
+const HEAT_LUT = (() => {
+  const lut = new Uint8ClampedArray(256*3);
+  const stops = [[0,8,0,18],[30,35,0,70],[80,100,0,150],[130,200,0,55],[170,255,50,0],[210,255,140,0],[240,255,220,0],[255,255,255,200]];
+  for(let i=0;i<256;i++){
+    let lo=stops[0],hi=stops[stops.length-1];
+    for(let s=0;s<stops.length-1;s++) if(i>=stops[s][0]&&i<=stops[s+1][0]){lo=stops[s];hi=stops[s+1];break;}
+    const t=lo[0]===hi[0]?0:(i-lo[0])/(hi[0]-lo[0]);
+    lut[i*3]=Math.round(lo[1]+(hi[1]-lo[1])*t);
+    lut[i*3+1]=Math.round(lo[2]+(hi[2]-lo[2])*t);
+    lut[i*3+2]=Math.round(lo[3]+(hi[3]-lo[3])*t);
+  }
+  return lut;
+})();
+
+// ── Audio ──────────────────────────────────────────────────────
+let AC=null, kAn=null, sAn=null;
+let DECAY_SECS=2.0;
+
+function boot(){
+  if(AC){if(AC.state==='suspended')AC.resume();return;}
+  AC=new AudioContext();
+  kAn=AC.createAnalyser(); kAn.fftSize=2048; kAn.smoothingTimeConstant=0.82;
+  sAn=AC.createAnalyser(); sAn.fftSize=2048; sAn.smoothingTimeConstant=0.82;
+  kAn.connect(AC.destination); sAn.connect(AC.destination);
+}
+
+const keySounds = {
+  Piano: (f,dest) => {
+    const d=DECAY_SECS+0.4, g=AC.createGain(); g.connect(dest);
+    [[1,.50],[2,.28],[3,.15],[4,.08],[5,.04],[6,.02]].forEach(([h,a])=>{
+      const o=AC.createOscillator(),hg=AC.createGain();
+      o.type='sine';o.frequency.value=f*h;hg.gain.value=a;o.connect(hg);hg.connect(g);o.start();o.stop(AC.currentTime+d);
+    });
+    g.gain.setValueAtTime(0,AC.currentTime);g.gain.linearRampToValueAtTime(0.44,AC.currentTime+0.008);g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+d);
+  },
+  Organ: (f,dest) => {
+    const d=DECAY_SECS, g=AC.createGain(); g.connect(dest);
+    [[1,.4],[2,.35],[3,.2],[4,.12],[6,.08],[8,.04]].forEach(([h,a])=>{
+      const o=AC.createOscillator(),hg=AC.createGain();
+      o.type='sine';o.frequency.value=f*h;hg.gain.value=a;o.connect(hg);hg.connect(g);o.start();o.stop(AC.currentTime+d);
+    });
+    g.gain.setValueAtTime(0,AC.currentTime);g.gain.linearRampToValueAtTime(0.4,AC.currentTime+0.015);g.gain.setValueAtTime(0.4,AC.currentTime+d*0.88);g.gain.linearRampToValueAtTime(0.0001,AC.currentTime+d);
+  },
+  Bell: (f,dest) => {
+    const d=DECAY_SECS*1.6, g=AC.createGain(); g.connect(dest);
+    [[1,.5],[2.756,.3],[5.404,.15],[3.5,.1],[7.2,.06]].forEach(([h,a])=>{
+      const o=AC.createOscillator(),hg=AC.createGain();
+      o.type='sine';o.frequency.value=f*h;hg.gain.value=a;o.connect(hg);hg.connect(g);o.start();o.stop(AC.currentTime+d);
+    });
+    g.gain.setValueAtTime(0,AC.currentTime);g.gain.linearRampToValueAtTime(0.38,AC.currentTime+0.004);g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+d);
+  },
+  Marimba: (f,dest) => {
+    const d=Math.min(DECAY_SECS*0.5,1.5), g=AC.createGain(); g.connect(dest);
+    [[1,.6],[4,.25],[10,.08],[3,.15]].forEach(([h,a])=>{
+      const o=AC.createOscillator(),hg=AC.createGain();
+      o.type='sine';o.frequency.value=f*h;hg.gain.value=a;o.connect(hg);hg.connect(g);o.start();o.stop(AC.currentTime+d);
+    });
+    g.gain.setValueAtTime(0,AC.currentTime);g.gain.linearRampToValueAtTime(0.45,AC.currentTime+0.005);g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+d);
+  },
+};
+
+const strSounds = {
+  Guitar: (f,dest) => {
+    const dur=DECAY_SECS*0.75, g=AC.createGain(),flt=AC.createBiquadFilter();
+    flt.type='lowpass';flt.Q.value=4;g.connect(flt);flt.connect(dest);
+    [{t:'sawtooth',dt:0,a:.55},{t:'triangle',dt:-7,a:.22},{t:'triangle',dt:7,a:.22}].forEach(({t,dt,a})=>{
+      const o=AC.createOscillator(),og=AC.createGain();
+      o.type=t;o.frequency.value=f;o.detune.value=dt;og.gain.value=a;o.connect(og);og.connect(g);o.start();o.stop(AC.currentTime+dur);
+    });
+    g.gain.setValueAtTime(0.5,AC.currentTime);g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+dur);
+    flt.frequency.setValueAtTime(f*20,AC.currentTime);flt.frequency.exponentialRampToValueAtTime(f*2,AC.currentTime+dur);
+  },
+  Harp: (f,dest) => {
+    const d=DECAY_SECS+0.2, g=AC.createGain(); g.connect(dest);
+    [[1,.55],[2,.2],[3,.1],[4,.05]].forEach(([h,a])=>{
+      const o=AC.createOscillator(),hg=AC.createGain();
+      o.type='sine';o.frequency.value=f*h;hg.gain.value=a;o.connect(hg);hg.connect(g);o.start();o.stop(AC.currentTime+d);
+    });
+    g.gain.setValueAtTime(0,AC.currentTime);g.gain.linearRampToValueAtTime(0.42,AC.currentTime+0.004);g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+d);
+  },
+  Bass: (f,dest) => {
+    const d=DECAY_SECS*0.85, g=AC.createGain(),flt=AC.createBiquadFilter();
+    flt.type='lowpass';flt.frequency.value=f*5;flt.Q.value=2;g.connect(flt);flt.connect(dest);
+    const o=AC.createOscillator(),o2=AC.createOscillator(),g2=AC.createGain();
+    o.type='sawtooth';o.frequency.value=f/2;o2.type='sawtooth';o2.frequency.value=f;g2.gain.value=0.25;
+    o.connect(g);o2.connect(g2);g2.connect(g);o.start();o.stop(AC.currentTime+d);o2.start();o2.stop(AC.currentTime+d);
+    g.gain.setValueAtTime(0,AC.currentTime);g.gain.linearRampToValueAtTime(0.5,AC.currentTime+0.02);g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+d);
+  },
+  Sitar: (f,dest) => {
+    const dur=DECAY_SECS*0.65, g=AC.createGain(),dist=AC.createWaveShaper();
+    const curve=new Float32Array(256);for(let i=0;i<256;i++){const x=i*2/255-1;curve[i]=x*(9)/(1+6*Math.abs(x));}
+    dist.curve=curve;g.connect(dist);dist.connect(dest);
+    [{dt:0,a:.4},{dt:12,a:.2},{dt:-5,a:.2},{dt:19,a:.1}].forEach(({dt,a})=>{
+      const o=AC.createOscillator(),hg=AC.createGain();
+      o.type='sawtooth';o.frequency.value=f;o.detune.value=dt;hg.gain.value=a;o.connect(hg);hg.connect(g);o.start();o.stop(AC.currentTime+dur);
+    });
+    g.gain.setValueAtTime(0.35,AC.currentTime);g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+dur);
+  },
+};
+
+function playNote(midi, synthFn, analyser){ boot(); synthFn(noteFreq(midi), analyser); }
+
+// ── Spectrogram ────────────────────────────────────────────────
+function Spectrogram({ viewMode }) {
+  const ref = useRef(null);
+  const raf = useRef(null);
+
+  useEffect(() => {
+    const canvas = ref.current;
+    const dpr = window.devicePixelRatio||1;
+    const resize = () => {
+      canvas.width  = canvas.offsetWidth*dpr;
+      canvas.height = canvas.offsetHeight*dpr;
+    };
+    const ro = new ResizeObserver(resize);
+    ro.observe(canvas); resize();
+
+    let alive=true, frameCount=0;
+    const SCROLL_EVERY=3;
+
+    const drawBars = (ctx,W,H) => {
+      ctx.clearRect(0,0,W,H);
+      if(!AC){
+        ctx.fillStyle='rgba(220,215,255,0.12)';ctx.font=`${10*dpr}px Space Mono`;ctx.textAlign='center';
+        ctx.fillText('tap a note to begin',W/2,H/2+4*dpr);return;
+      }
+      const bins=kAn.frequencyBinCount;
+      const kd=new Uint8Array(bins),sd=new Uint8Array(bins);
+      kAn.getByteFrequencyData(kd);sAn.getByteFrequencyData(sd);
+      const sr=AC.sampleRate, maxBin=Math.min(Math.floor(6000/(sr/2)*bins),bins-1);
+      const bw=W/maxBin, half=H/2;
+      for(let i=0;i<maxBin;i++){
+        const x=i*bw, kv=kd[i]/255, sv=sd[i]/255;
+        if(kv>0.01){const h=kv*half*0.92;const grd=ctx.createLinearGradient(0,half-h,0,half);grd.addColorStop(0,`rgba(108,99,255,${kv*.9})`);grd.addColorStop(1,`rgba(60,50,200,.1)`);ctx.fillStyle=grd;ctx.fillRect(x,half-h,Math.max(bw-.5,1),h);}
+        if(sv>0.01){const h=sv*half*0.92;const grd=ctx.createLinearGradient(0,half,0,half+h);grd.addColorStop(0,`rgba(255,107,157,${sv*.9})`);grd.addColorStop(1,`rgba(200,50,100,.1)`);ctx.fillStyle=grd;ctx.fillRect(x,half,Math.max(bw-.5,1),h);}
+      }
+      ctx.strokeStyle='rgba(255,255,255,0.08)';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,half);ctx.lineTo(W,half);ctx.stroke();
+      ctx.fillStyle='rgba(220,215,255,0.2)';ctx.font=`${6.5*dpr}px Space Mono`;ctx.textAlign='left';
+      ctx.fillText('keys',4*dpr,11*dpr);ctx.fillText('string',4*dpr,half+11*dpr);
+    };
+
+    const drawSgram = (ctx,W,H) => {
+      if(!AC){
+        ctx.fillStyle='rgba(220,215,255,0.12)';ctx.font=`${10*dpr}px Space Mono`;ctx.textAlign='center';
+        ctx.fillText('tap a note to begin',W/2,H/2+4*dpr);return;
+      }
+      const bins=kAn.frequencyBinCount;
+      const kd=new Uint8Array(bins),sd=new Uint8Array(bins);
+      kAn.getByteFrequencyData(kd);sAn.getByteFrequencyData(sd);
+      const sr=AC.sampleRate, maxBin=Math.min(Math.floor(6000/(sr/2)*bins),bins-1);
+      const maxK=kd.reduce((m,v)=>v>m?v:m,0), maxS=sd.reduce((m,v)=>v>m?v:m,0);
+      const hasSound=maxK>8||maxS>8;
+      frameCount++;
+      if(hasSound&&frameCount>=SCROLL_EVERY){
+        frameCount=0;
+        ctx.drawImage(canvas,-1,0);ctx.clearRect(W-1,0,1,H);
+        const half=Math.floor(H/2), col=ctx.createImageData(1,H), d=col.data;
+        for(let y=0;y<half;y++){
+          const bin=Math.floor((1-y/half)*maxBin), v=kd[Math.min(bin,kd.length-1)];
+          const idx=y*4;d[idx]=HEAT_LUT[v*3];d[idx+1]=HEAT_LUT[v*3+1];d[idx+2]=HEAT_LUT[v*3+2];d[idx+3]=255;
+        }
+        const di=half*4;d[di]=30;d[di+1]=30;d[di+2]=40;d[di+3]=255;
+        for(let y=half+1;y<H;y++){
+          const ly=y-half-1,lh=Math.max(H-half-1,1),bin=Math.floor((1-ly/lh)*maxBin),v=sd[Math.min(bin,sd.length-1)];
+          const idx=y*4;d[idx]=HEAT_LUT[v*3];d[idx+1]=HEAT_LUT[v*3+1];d[idx+2]=HEAT_LUT[v*3+2];d[idx+3]=255;
+        }
+        ctx.putImageData(col,W-1,0);
+      }
+      const half2=Math.floor(H/2);
+      ctx.fillStyle='rgba(220,215,255,0.22)';ctx.font=`${6.5*dpr}px Space Mono`;ctx.textAlign='left';
+      ctx.fillText('KEYS',4*dpr,11*dpr);ctx.fillText('STRING',4*dpr,half2+11*dpr);
+    };
+
+    const draw = ()=>{
+      if(!alive)return;
+      raf.current=requestAnimationFrame(draw);
+      const ctx=canvas.getContext('2d');const W=canvas.width,H=canvas.height;
+      if(viewMode==='sgram')drawSgram(ctx,W,H); else drawBars(ctx,W,H);
+    };
+    canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
+    draw();
+    return ()=>{alive=false;cancelAnimationFrame(raf.current);ro.disconnect();};
+  },[viewMode]);
+
+  return <canvas ref={ref} style={{width:'100%',height:'100%',display:'block'}}/>;
+}
+
+// ── Pill row ───────────────────────────────────────────────────
+function Pills({ options, selected, onChange, activeColor='#00d4a8' }) {
+  return (
+    <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>
+      {options.map(([k,label])=>(
+        <button key={k} onPointerDown={()=>onChange(k)} style={{
+          fontSize:10,padding:'6px 13px',borderRadius:20,touchAction:'none',
+          background:selected===k?`rgba(0,212,168,0.16)`:'rgba(255,255,255,0.05)',
+          color:selected===k?activeColor:'rgba(220,215,255,0.38)',
+          outline:selected===k?`1px solid rgba(0,212,168,0.45)`:'1px solid rgba(255,255,255,0.07)',
+          transition:'all 0.12s',letterSpacing:'0.05em',
+        }}>{label}</button>
+      ))}
+    </div>
+  );
+}
+
+// ── Sound chips ────────────────────────────────────────────────
+function SoundChips({ options, selected, onChange, color }) {
+  return (
+    <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>
+      {Object.keys(options).map(k=>(
+        <button key={k} onPointerDown={()=>onChange(k)} style={{
+          fontSize:9,padding:'5px 11px',borderRadius:20,touchAction:'none',
+          background:selected===k?`${color}22`:'rgba(255,255,255,0.04)',
+          color:selected===k?color:'rgba(220,215,255,0.32)',
+          outline:selected===k?`1px solid ${color}55`:'1px solid rgba(255,255,255,0.06)',
+          transition:'all 0.12s',letterSpacing:'0.05em',
+        }}>{k}</button>
+      ))}
+    </div>
+  );
+}
+
+// ── Note dot ───────────────────────────────────────────────────
+function Dot({ midi, active, score, onPlay, color, rgb }) {
+  const name=noteName(midi), black=isBlack(midi), isC=midi%12===0, oct=Math.floor(midi/12)-1;
+  const sRGB=score>0.8?'0,212,168':score>0.55?'160,210,50':score>0.3?'220,145,15':'65,65,85';
+  const onInteract=useCallback(e=>{e.preventDefault();e.stopPropagation();onPlay(midi);},[midi,onPlay]);
+  return (
+    <div onPointerDown={onInteract} style={{
+      width:'100%',
+      aspectRatio:'1',
+      borderRadius:'50%',
+      display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',
+      cursor:'pointer',position:'relative',touchAction:'none',
+      transition:'transform 0.07s,box-shadow 0.1s,background 0.1s',
+      background:active?color:black?'rgba(0,0,0,0.5)':'rgba(255,255,255,0.05)',
+      border:active?`2px solid rgba(${rgb},.9)`:score>0.55?`1.5px solid rgba(${sRGB},.42)`:`1.5px solid rgba(255,255,255,${isC?.14:.05})`,
+      boxShadow:active?`0 0 16px 4px rgba(${rgb},.5),0 0 7px 2px rgba(${rgb},.65) inset`:score>0.75?`0 0 0 2px rgba(${sRGB},.32)`:'none',
+      transform:active?'scale(0.87)':'scale(1)',
+    }}>
+      {!active&&score>0.55&&(
+        <div style={{position:'absolute',inset:-4,borderRadius:'50%',border:`2px solid rgba(${sRGB},${Math.min(score*.55,.5)})`,pointerEvents:'none',animation:score>0.85?'pulse 2s ease-in-out infinite':'none'}}/>
+      )}
+      <span style={{fontSize:12,fontWeight:active?700:400,color:active?'#fff':black?'rgba(255,255,255,.27)':'rgba(220,215,255,.5)',lineHeight:1,userSelect:'none',pointerEvents:'none'}}>{name}</span>
+      {isC&&<span style={{fontSize:9,color:active?'rgba(255,255,255,.55)':'rgba(220,215,255,.2)',lineHeight:1,marginTop:2,userSelect:'none'}}>{oct}</span>}
+    </div>
+  );
+}
+
+// ── Instrument strip ───────────────────────────────────────────
+function Strip({ kind, label, color, rgb, soundLib, notes, activeNotes, harmScores, onPlay }) {
+  const [sound,setSound]=useState(Object.keys(soundLib)[0]);
+  const anyActive=notes.some(m=>activeNotes[m]?.[kind]);
+  const handlePlay=useCallback(midi=>onPlay(midi,soundLib[sound]),[sound,soundLib,onPlay]);
+  return (
+    <div style={{padding:'8px 12px',borderTop:'1px solid rgba(255,255,255,0.05)',background:'rgba(255,255,255,0.013)'}}>
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:7}}>
+        <div style={{width:7,height:7,borderRadius:'50%',background:color,flexShrink:0,boxShadow:anyActive?`0 0 10px 4px rgba(${rgb},.7)`:'none',transition:'box-shadow .2s'}}/>
+        <span style={{fontSize:9,letterSpacing:'.15em',color:'rgba(220,215,255,.28)',textTransform:'uppercase'}}>{label}</span>
+        <div style={{marginLeft:'auto'}}>
+          <SoundChips options={soundLib} selected={sound} onChange={setSound} color={color}/>
+        </div>
+      </div>
+      {/* Two-row grid: one octave per row */}
+      <div style={{
+        display:'grid',
+        gridTemplateColumns:'repeat(12, 1fr)',
+        gap:3,
+      }}>
+        {notes.map(m=>(
+          <Dot key={m} midi={m} active={!!(activeNotes[m]?.[kind])} score={harmScores[m]||0} onPlay={handlePlay} color={color} rgb={rgb}/>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Harmony bar ────────────────────────────────────────────────
+function HarmBar({ notes, harmScores, activeNotes }) {
+  const c=s=>s>.8?'rgba(0,212,168,':s>.55?'rgba(160,210,50,':s>.3?'rgba(220,145,15,':'rgba(45,45,60,';
+  return (
+    <div style={{
+      display:'grid',
+      gridTemplateColumns:'repeat(12, 1fr)',
+      gap:3,
+      padding:'0 12px',
+    }}>
+      {notes.map(m=>{
+        const s=harmScores[m]||0, active=Object.values(activeNotes[m]||{}).some(Boolean);
+        return <div key={m} style={{height:12,borderRadius:3,background:active?'rgba(255,255,255,.18)':`${c(s)}${s*.5+.08})`,border:active?'1px solid rgba(255,255,255,.2)':'1px solid rgba(255,255,255,.04)',transition:'background .25s',display:'flex',alignItems:'center',justifyContent:'center'}}>
+          {s>.8&&!active&&<span style={{fontSize:5,color:'rgba(255,255,255,.5)'}}>{NAMES[m%12]}</span>}
+        </div>;
+      })}
+    </div>
+  );
+}
+
+// ── App ────────────────────────────────────────────────────────
+function App() {
+  const [activeNotes,setActiveNotes]=useState({});
+  const [recentMidis,setRecentMidis]=useState([]);
+  const [harmType,setHarmType]=useState('intervals');
+  const [harmSub,setHarmSub]=useState('consonant');
+  const [viewMode,setViewMode]=useState('sgram');
+  const [decaySecs,setDecaySecs]=useState(2.0);
+
+  useEffect(()=>{ DECAY_SECS=decaySecs; },[decaySecs]);
+
+  const notes=useMemo(()=>Array.from({length:24},(_,i)=>48+i),[]);
+  const activeMidis=useMemo(()=>Object.entries(activeNotes).filter(([,v])=>Object.keys(v).length>0).map(([k])=>+k),[activeNotes]);
+  const roots=activeMidis.length?activeMidis:recentMidis.slice(0,3);
+  const harmScores=useMemo(()=>Object.fromEntries(notes.map(m=>[m,getHarmScore(m,roots,harmType,harmSub)])),[notes,roots,harmType,harmSub]);
+
+  // Sub-options for current type
+  const subOptions = useMemo(()=>{
+    const subs = HARM_SYSTEM[harmType]?.sub;
+    if(!subs||Object.keys(subs).length<=1) return null;
+    return Object.keys(subs).map(k=>[k, k.charAt(0).toUpperCase()+k.slice(1)]);
+  },[harmType]);
+
+  // When type changes, pick first sub
+  useEffect(()=>{
+    const subs=HARM_SYSTEM[harmType]?.sub;
+    if(subs) setHarmSub(Object.keys(subs)[0]);
+  },[harmType]);
+
+  const schedRemove=useCallback((midi,kind,ms)=>{
+    setTimeout(()=>{
+      setActiveNotes(prev=>{
+        const n={...prev};if(!n[midi])return prev;
+        const u={...n[midi]};delete u[kind];
+        if(!Object.keys(u).length)delete n[midi];else n[midi]=u;return n;
+      });
+    },ms);
+  },[]);
+
+  const handlePlay=useCallback((midi,kind,synthFn,durMs)=>{
+    playNote(midi,synthFn,kind==='keys'?kAn:sAn);
+    setActiveNotes(p=>({...p,[midi]:{...(p[midi]||{}),[kind]:true}}));
+    setRecentMidis(p=>[midi,...p.filter(x=>x!==midi)].slice(0,6));
+    schedRemove(midi,kind,durMs);
+  },[schedRemove]);
+
+  const handleKeys  =useCallback((midi,fn)=>handlePlay(midi,'keys',fn,(DECAY_SECS+0.4)*1000),[handlePlay]);
+  const handleString=useCallback((midi,fn)=>handlePlay(midi,'string',fn,(DECAY_SECS*0.75+0.2)*1000),[handlePlay]);
+
+  const typeOptions=[['intervals','Intervals'],['chord','Chord'],['scale','Scale']];
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',height:'100%',overflow:'hidden'}}>
+
+      {/* Header */}
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'8px 13px 6px',borderBottom:'1px solid rgba(255,255,255,0.05)',flexShrink:0}}>
+        <div>
+          <span style={{fontSize:10,letterSpacing:'.2em',color:'rgba(220,215,255,.75)'}}>HARMONY</span>
+          <span style={{fontSize:10,letterSpacing:'.2em',color:'rgba(220,215,255,.22)',marginLeft:7}}>VIZ</span>
+        </div>
+        <div style={{display:'flex',gap:5}}>
+          {['sgram','bars'].map(v=>(
+            <button key={v} onPointerDown={()=>setViewMode(v)} style={{fontSize:9,padding:'4px 10px',borderRadius:4,background:viewMode===v?'rgba(255,255,255,.09)':'transparent',color:viewMode===v?'rgba(220,215,255,.9)':'rgba(220,215,255,.3)',outline:viewMode===v?'1px solid rgba(255,255,255,.14)':'none',letterSpacing:'.05em'}}>{v==='sgram'?'Spectro':'Bars'}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Visualizer — grows to fill leftover space */}
+      <div style={{flex:1,minHeight:100,position:'relative',background:'#060409',borderBottom:'1px solid rgba(255,255,255,0.04)'}}>
+        <Spectrogram viewMode={viewMode}/>
+        {activeMidis.length>0&&(
+          <div style={{position:'absolute',top:5,right:7,display:'flex',gap:4,flexWrap:'wrap',justifyContent:'flex-end'}}>
+            {activeMidis.map(m=>{const isK=activeNotes[m]?.keys;return(
+              <span key={m} style={{fontSize:9,padding:'2px 6px',borderRadius:4,background:isK?'rgba(108,99,255,.2)':'rgba(255,107,157,.2)',border:`1px solid ${isK?'rgba(108,99,255,.5)':'rgba(255,107,157,.5)'}`,color:isK?'#9490ff':'#ff8db4'}}>{NAMES[m%12]}{Math.floor(m/12)-1}</span>
+            );})}
+          </div>
+        )}
+      </div>
+
+      {/* Harmony controls */}
+      <div style={{flexShrink:0,padding:'7px 12px 6px',borderBottom:'1px solid rgba(255,255,255,0.05)',background:'rgba(0,212,168,0.025)'}}>
+        {/* Harmony bar */}
+        <div style={{marginBottom:5}}>
+          <HarmBar notes={notes} harmScores={harmScores} activeNotes={activeNotes}/>
+        </div>
+
+        {/* Type selector */}
+        <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:subOptions?6:0}}>
+          <span style={{fontSize:8,letterSpacing:'.12em',color:'rgba(220,215,255,.22)',textTransform:'uppercase',whiteSpace:'nowrap'}}>Mode</span>
+          <Pills options={typeOptions} selected={harmType} onChange={k=>{setHarmType(k);}}/>
+        </div>
+
+        {/* Sub-option selector */}
+        {subOptions&&(
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <span style={{fontSize:8,letterSpacing:'.12em',color:'rgba(220,215,255,.15)',textTransform:'uppercase',whiteSpace:'nowrap',minWidth:28}}></span>
+            <Pills options={subOptions} selected={harmSub} onChange={setHarmSub}/>
+          </div>
+        )}
+      </div>
+
+      {/* Decay */}
+      <div style={{flexShrink:0,display:'flex',alignItems:'center',gap:10,padding:'5px 13px',borderBottom:'1px solid rgba(255,255,255,0.04)'}}>
+        <span style={{fontSize:8,letterSpacing:'.12em',color:'rgba(220,215,255,.22)',textTransform:'uppercase',whiteSpace:'nowrap'}}>Decay</span>
+        <input type="range" min="0.3" max="5" step="0.1" value={decaySecs} onChange={e=>setDecaySecs(parseFloat(e.target.value))}
+          style={{flex:1,accentColor:'#00d4a8',background:'rgba(255,255,255,0.08)'}}/>
+        <span style={{fontSize:10,color:'rgba(0,212,168,.75)',minWidth:30,textAlign:'right'}}>{decaySecs.toFixed(1)}s</span>
+      </div>
+
+      {/* Strips — shrink-wrap, no blank gap */}
+      <div style={{flexShrink:0}}>
+        <Strip kind="keys"   label="Keys"   color="#6c63ff" rgb="108,99,255"  soundLib={keySounds} notes={notes} activeNotes={activeNotes} harmScores={harmScores} onPlay={handleKeys}/>
+        <Strip kind="string" label="String" color="#ff6b9d" rgb="255,107,157" soundLib={strSounds} notes={notes} activeNotes={activeNotes} harmScores={harmScores} onPlay={handleString}/>
+      </div>
+
+      <div style={{height:'env(safe-area-inset-bottom,4px)',flexShrink:0}}/>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
