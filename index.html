@@ -196,6 +196,115 @@ const strSounds = {
 
 function playNote(midi, synthFn, analyser){ boot(); synthFn(noteFreq(midi), analyser); }
 
+// ── Recording / clip playback ──────────────────────────────────
+// Taps the two analysers (keys L, string R) into a ScriptProcessor
+// and saves captured Float32 samples. Record and playback are
+// mutually exclusive (UI enforces).
+let _recNode=null, _recMerger=null, _recSilent=null;
+let _recBufL=[], _recBufR=[];
+let _recording=false;
+let _playSrc=null;
+
+function initRecorder(){
+  if(_recNode) return;
+  _recMerger=AC.createChannelMerger(2);
+  kAn.connect(_recMerger,0,0);
+  sAn.connect(_recMerger,0,1);
+  _recNode=AC.createScriptProcessor(4096,2,2);
+  _recMerger.connect(_recNode);
+  // silent sink so the node keeps processing (it needs a destination)
+  _recSilent=AC.createGain(); _recSilent.gain.value=0;
+  _recNode.connect(_recSilent); _recSilent.connect(AC.destination);
+  _recNode.onaudioprocess=e=>{
+    if(!_recording) return;
+    _recBufL.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    _recBufR.push(new Float32Array(e.inputBuffer.getChannelData(1)));
+  };
+}
+
+function startRec(){ boot(); initRecorder(); _recBufL=[]; _recBufR=[]; _recording=true; }
+
+function stopRec(){
+  _recording=false;
+  const total=_recBufL.reduce((s,b)=>s+b.length,0);
+  if(!total) return null;
+  const buf=AC.createBuffer(2,total,AC.sampleRate);
+  const L=buf.getChannelData(0), R=buf.getChannelData(1);
+  let off=0;
+  for(let i=0;i<_recBufL.length;i++){
+    L.set(_recBufL[i],off); R.set(_recBufR[i],off);
+    off+=_recBufL[i].length;
+  }
+  _recBufL=[]; _recBufR=[];
+  return buf;
+}
+
+// 16-bit PCM WAV encoder
+function encodeWAV(audioBuffer){
+  const nCh=audioBuffer.numberOfChannels, sr=audioBuffer.sampleRate, len=audioBuffer.length;
+  const dataSize=len*nCh*2;
+  const buf=new ArrayBuffer(44+dataSize), v=new DataView(buf);
+  const wS=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
+  wS(0,'RIFF'); v.setUint32(4,36+dataSize,true); wS(8,'WAVE');
+  wS(12,'fmt '); v.setUint32(16,16,true); v.setUint16(20,1,true);
+  v.setUint16(22,nCh,true); v.setUint32(24,sr,true);
+  v.setUint32(28,sr*nCh*2,true); v.setUint16(32,nCh*2,true); v.setUint16(34,16,true);
+  wS(36,'data'); v.setUint32(40,dataSize,true);
+  const chans=[]; for(let c=0;c<nCh;c++) chans.push(audioBuffer.getChannelData(c));
+  let off=44;
+  for(let i=0;i<len;i++){
+    for(let c=0;c<nCh;c++){
+      let s=Math.max(-1,Math.min(1,chans[c][i]));
+      v.setInt16(off, s<0?s*0x8000:s*0x7FFF, true);
+      off+=2;
+    }
+  }
+  return new Blob([buf],{type:'audio/wav'});
+}
+
+function downloadBlob(blob,name){
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download=name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+
+async function decodeFile(file){
+  boot();
+  const arr=await file.arrayBuffer();
+  return new Promise((resolve,reject)=>AC.decodeAudioData(arr.slice(0),resolve,reject));
+}
+
+// Routes a clip through kAn/sAn so the spectrogram lights up.
+// Stereo: L→kAn, R→sAn. Mono: halved and sent to both.
+function playClip(audioBuffer,onEnd){
+  boot();
+  stopClip();
+  _playSrc=AC.createBufferSource();
+  _playSrc.buffer=audioBuffer;
+  if(audioBuffer.numberOfChannels>=2){
+    const split=AC.createChannelSplitter(2);
+    _playSrc.connect(split);
+    split.connect(kAn,0);
+    split.connect(sAn,1);
+  } else {
+    const g=AC.createGain(); g.gain.value=0.5;
+    _playSrc.connect(g);
+    g.connect(kAn); g.connect(sAn);
+  }
+  _playSrc.start();
+  _playSrc.onended=()=>{ _playSrc=null; onEnd&&onEnd(); };
+}
+
+function stopClip(){
+  if(_playSrc){
+    try{_playSrc.stop();}catch(e){}
+    try{_playSrc.disconnect();}catch(e){}
+    _playSrc=null;
+  }
+}
+
 // ── Spectrogram ────────────────────────────────────────────────
 function Spectrogram({ viewMode }) {
   const ref = useRef(null);
@@ -398,6 +507,10 @@ function App() {
   const [harmSub,setHarmSub]=useState('consonant');
   const [viewMode,setViewMode]=useState('sgram');
   const [decaySecs,setDecaySecs]=useState(2.0);
+  const [isRec,setIsRec]=useState(false);
+  const [isPlay,setIsPlay]=useState(false);
+  const [clipDur,setClipDur]=useState(0);
+  const clipRef=useRef(null);
 
   useEffect(()=>{ DECAY_SECS=decaySecs; },[decaySecs]);
 
@@ -438,6 +551,46 @@ function App() {
 
   const handleKeys  =useCallback((midi,fn)=>handlePlay(midi,'keys',fn,(DECAY_SECS+0.4)*1000),[handlePlay]);
   const handleString=useCallback((midi,fn)=>handlePlay(midi,'string',fn,(DECAY_SECS*0.75+0.2)*1000),[handlePlay]);
+
+  // ── Clip handlers ───────────────────────────────────────────
+  const toggleRec=useCallback(()=>{
+    if(isRec){
+      const buf=stopRec();
+      setIsRec(false);
+      if(buf){ clipRef.current=buf; setClipDur(buf.duration); }
+    } else {
+      if(isPlay){ stopClip(); setIsPlay(false); }
+      startRec();
+      setIsRec(true);
+    }
+  },[isRec,isPlay]);
+
+  const togglePlay=useCallback(()=>{
+    if(!clipRef.current) return;
+    if(isPlay){ stopClip(); setIsPlay(false); }
+    else { setIsPlay(true); playClip(clipRef.current,()=>setIsPlay(false)); }
+  },[isPlay]);
+
+  const saveClip=useCallback(()=>{
+    if(!clipRef.current) return;
+    const ts=new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+    downloadBlob(encodeWAV(clipRef.current), `harmony-${ts}.wav`);
+  },[]);
+
+  const onFile=useCallback(async e=>{
+    const file=e.target.files?.[0];
+    if(!file) return;
+    try {
+      const buf=await decodeFile(file);
+      if(isPlay){ stopClip(); setIsPlay(false); }
+      clipRef.current=buf; setClipDur(buf.duration);
+    } catch(err){
+      console.error('decode failed:',err);
+      alert('Could not decode this audio file.');
+    } finally {
+      e.target.value='';
+    }
+  },[isPlay]);
 
   const typeOptions=[['intervals','Intervals'],['chord','Chord'],['scale','Scale']];
 
@@ -497,6 +650,47 @@ function App() {
         <input type="range" min="0.3" max="5" step="0.1" value={decaySecs} onChange={e=>setDecaySecs(parseFloat(e.target.value))}
           style={{flex:1,accentColor:'#00d4a8',background:'rgba(255,255,255,0.08)'}}/>
         <span style={{fontSize:10,color:'rgba(0,212,168,.75)',minWidth:30,textAlign:'right'}}>{decaySecs.toFixed(1)}s</span>
+      </div>
+
+      {/* Clip controls */}
+      <div style={{flexShrink:0,display:'flex',alignItems:'center',gap:5,padding:'6px 13px',borderBottom:'1px solid rgba(255,255,255,0.04)',flexWrap:'wrap'}}>
+        <span style={{fontSize:8,letterSpacing:'.12em',color:'rgba(220,215,255,.22)',textTransform:'uppercase',whiteSpace:'nowrap'}}>Clip</span>
+
+        <button onPointerDown={toggleRec} style={{
+          fontSize:9,padding:'6px 10px',borderRadius:4,touchAction:'none',letterSpacing:'.05em',
+          background:isRec?'rgba(255,80,100,.22)':'rgba(255,255,255,.05)',
+          color:isRec?'#ff6b7e':'rgba(220,215,255,.55)',
+          outline:isRec?'1px solid rgba(255,80,100,.5)':'1px solid rgba(255,255,255,.08)',
+          animation:isRec?'pulse 1.2s ease-in-out infinite':'none',
+        }}>{isRec?'\u25A0 STOP':'\u25CF REC'}</button>
+
+        <button onPointerDown={togglePlay} disabled={!clipDur||isRec} style={{
+          fontSize:9,padding:'6px 10px',borderRadius:4,touchAction:'none',letterSpacing:'.05em',
+          background:isPlay?'rgba(0,212,168,.18)':'rgba(255,255,255,.05)',
+          color:(!clipDur||isRec)?'rgba(220,215,255,.2)':isPlay?'#00d4a8':'rgba(220,215,255,.55)',
+          outline:isPlay?'1px solid rgba(0,212,168,.5)':'1px solid rgba(255,255,255,.08)',
+          opacity:(!clipDur||isRec)?.45:1,
+        }}>{isPlay?'\u25A0 STOP':'\u25B6 PLAY'}</button>
+
+        <button onPointerDown={saveClip} disabled={!clipDur} style={{
+          fontSize:9,padding:'6px 10px',borderRadius:4,touchAction:'none',letterSpacing:'.05em',
+          background:'rgba(255,255,255,.05)',
+          color:!clipDur?'rgba(220,215,255,.2)':'rgba(220,215,255,.55)',
+          outline:'1px solid rgba(255,255,255,.08)',opacity:!clipDur?.45:1,
+        }}>{'\u2193 WAV'}</button>
+
+        <label style={{
+          fontSize:9,padding:'6px 10px',borderRadius:4,letterSpacing:'.05em',cursor:'pointer',
+          background:'rgba(255,255,255,.05)',color:'rgba(220,215,255,.55)',
+          outline:'1px solid rgba(255,255,255,.08)',
+        }}>
+          {'\u2191 LOAD'}
+          <input type="file" accept="audio/*,.wav" onChange={onFile} style={{display:'none'}}/>
+        </label>
+
+        {clipDur>0&&(
+          <span style={{fontSize:10,color:'rgba(0,212,168,.75)',marginLeft:'auto',minWidth:30,textAlign:'right'}}>{clipDur.toFixed(1)}s</span>
+        )}
       </div>
 
       {/* Strips — shrink-wrap, no blank gap */}
